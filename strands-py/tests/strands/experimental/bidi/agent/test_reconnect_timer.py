@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from strands.experimental.bidi.agent._reconnect_timer import BidiReconnectTimer, resolve_deadline_s
+from strands.experimental.bidi.agent._reconnect_timer import _ReconnectTimer, resolve_deadline_s
 
 # resolve_deadline_s
 
@@ -30,7 +30,7 @@ def test_resolve_deadline_none_when_not_positive():
     assert resolve_deadline_s({"restart_after_s": -5}) is None
 
 
-# BidiReconnectTimer
+# _ReconnectTimer
 
 
 @pytest.mark.asyncio
@@ -42,7 +42,7 @@ async def test_timer_fires_warning_then_deadline():
     async def fake_sleep(seconds):
         sleeps.append(seconds)
 
-    timer = BidiReconnectTimer(
+    timer = _ReconnectTimer(
         on_warning=lambda t: _record(warnings, t),
         on_deadline=lambda: _record(deadlines, None),
         sleep=fake_sleep,
@@ -59,9 +59,49 @@ async def test_timer_fires_warning_then_deadline():
 
 
 @pytest.mark.asyncio
+async def test_timer_deadline_countdown_continues_while_warning_is_blocked():
+    """Warning backpressure does not add its duration to the deadline countdown."""
+    warning_started = asyncio.Event()
+    release_warning = asyncio.Event()
+    deadline_sleep_started = asyncio.Event()
+    deadline_elapsed = asyncio.Event()
+    deadlines = []
+    sleep_count = 0
+
+    async def fake_sleep(_seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 2:
+            deadline_sleep_started.set()
+            await deadline_elapsed.wait()
+
+    async def blocked_warning(_time_left_s):
+        warning_started.set()
+        await release_warning.wait()
+
+    timer = _ReconnectTimer(
+        on_warning=blocked_warning,
+        on_deadline=lambda: _record(deadlines, None),
+        sleep=fake_sleep,
+    )
+    timer.arm(deadline_s=420, warning_lead_s=30)
+
+    await warning_started.wait()
+    await deadline_sleep_started.wait()
+    deadline_elapsed.set()
+    await asyncio.sleep(0)
+    assert deadlines == []  # warning ordering is preserved even after the deadline elapses
+
+    release_warning.set()
+    await timer._task
+
+    assert deadlines == [None]
+
+
+@pytest.mark.asyncio
 async def test_timer_cancel_is_safe_when_idle():
     """cancel() before arming does not raise."""
-    timer = BidiReconnectTimer(on_warning=_noop_arg, on_deadline=_noop)
+    timer = _ReconnectTimer(on_warning=_noop_arg, on_deadline=_noop)
     timer.cancel()  # should not raise
 
 
@@ -76,7 +116,7 @@ async def test_timer_rearm_cancels_previous():
         started.set()
         await asyncio.sleep(3600)
 
-    timer = BidiReconnectTimer(
+    timer = _ReconnectTimer(
         on_warning=_noop_arg,
         on_deadline=lambda: _record(deadlines, None),
         sleep=slow_sleep,

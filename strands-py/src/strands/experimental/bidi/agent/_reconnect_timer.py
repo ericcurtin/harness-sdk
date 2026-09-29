@@ -1,20 +1,20 @@
 """Proactive reconnect timer for bidirectional streaming.
 
-``BidiReconnectTimer`` fires a warning then a deadline callback at caller-supplied offsets;
+``_ReconnectTimer`` fires a warning then a deadline callback at caller-supplied offsets;
 it holds no reconnect policy. ``resolve_deadline_s`` reads the deadline from a provider's
-declared ``BidiConnectionConfig``.
+declared ``ConnectionConfig``.
 """
 
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
-from ..types.model import BidiConnectionConfig
+from ..models.configs import ConnectionConfig
 
 logger = logging.getLogger(__name__)
 
 
-def resolve_deadline_s(connection_config: BidiConnectionConfig) -> int | None:
+def resolve_deadline_s(connection_config: ConnectionConfig) -> int | None:
     """Resolve the proactive reconnect deadline in seconds from a connection config.
 
     Args:
@@ -29,7 +29,7 @@ def resolve_deadline_s(connection_config: BidiConnectionConfig) -> int | None:
     return restart_after_s
 
 
-class BidiReconnectTimer:
+class _ReconnectTimer:
     """Fire a warning then a deadline callback ahead of a provider's connection limit.
 
     The clock is injectable so tests can drive timing without wall time.
@@ -79,15 +79,22 @@ class BidiReconnectTimer:
 
         The warning fires ``warning_lead_s`` before the deadline. When the lead is zero
         or exceeds the deadline, the warning is emitted immediately and the remaining
-        wait runs down to the deadline.
+        wait runs down to the deadline. The deadline countdown continues while warning
+        delivery is backpressured, but the deadline callback still follows the warning.
         """
         warning_at_s = max(deadline_s - warning_lead_s, 0)
 
         await self._sleep(warning_at_s)
         time_left_s = deadline_s - warning_at_s
-        await self._on_warning(time_left_s)
+        deadline_sleep: asyncio.Future[None] = asyncio.ensure_future(self._sleep(deadline_s - warning_at_s))
+        try:
+            await self._on_warning(time_left_s)
+            await deadline_sleep
+        finally:
+            if not deadline_sleep.done():
+                deadline_sleep.cancel()
+            await asyncio.gather(deadline_sleep, return_exceptions=True)
 
-        await self._sleep(deadline_s - warning_at_s)
         # Detach before the callback re-arms this timer; cancelling a live self-reference
         # would abort the reconnect the callback runs.
         self._task = None
